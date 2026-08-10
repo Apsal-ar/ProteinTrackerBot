@@ -118,6 +118,7 @@ An hourly job checks whether it is 19:00 UTC. At that hour, users who have a tar
 
 ```
 bot.py                      # Entry point, handler registration, polling
+logging_config.py           # Console + rotating users/reminders log files
 database.py                 # Pool, schema, CRUD
 jobs.py                     # Reminder job
 nutrition.py                # Placeholder for future food-lookup helpers
@@ -150,3 +151,19 @@ handlers/
    ```
 
 Tables are created automatically on first run.
+
+## Logs
+
+Two rotating log files are written in the project root (kept ~7 days; not committed to git):
+
+| File | Contents |
+| --- | --- |
+| `users.log` | User-driven actions (includes `user_id`) |
+| `reminders.log` | Automatic reminder job (`send_reminders_job`) |
+
+Console output continues as usual. Examples:
+
+```bash
+grep 'user_id=123' users.log
+grep send_reminders_job reminders.log
+```

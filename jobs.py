@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 
 import database
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("protein_tracker.reminders")
 
 REMINDER_HOUR = 19  # 19:00 UTC
 

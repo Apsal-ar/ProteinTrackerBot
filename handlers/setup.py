@@ -10,7 +10,7 @@ from telegram.ext import ContextTypes
 
 import database
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("protein_tracker.users")
 
 # Callback data prefix for standard portion USDA choice
 STD_CB_PREFIX = "std|"

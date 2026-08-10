@@ -10,6 +10,7 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 
 import database
 import jobs
+from logging_config import setup_logging
 from handlers.bot_logger import log_handler, quicklog_handler
 from handlers.foods import (
     deletefood_callback_handler,
@@ -33,11 +34,7 @@ from handlers.setup import (
 )
 
 load_dotenv()
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 

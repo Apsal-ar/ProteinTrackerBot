@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 
 import database
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("protein_tracker.users")
 
 FOOD_NAME_QUICKLOG = "-"
 

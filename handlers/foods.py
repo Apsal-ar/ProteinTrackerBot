@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 
 import database
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("protein_tracker.users")
 
 KEY_DELETEFOOD_PENDING = "deletefood_pending"
 KEY_DELETEFOOD_CONFIRM = "deletefood_confirm"

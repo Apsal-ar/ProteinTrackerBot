@@ -16,7 +16,7 @@ from telegram.ext import ContextTypes
 import database
 from handlers.bot_logger import _parse_log_item
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("protein_tracker.users")
 
 WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 

@@ -41,3 +41,9 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime logs (rotated locally; not committed)
+users.log
+users.log.*
+reminders.log
+reminders.log.*

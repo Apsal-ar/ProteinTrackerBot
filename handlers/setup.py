@@ -1,14 +1,16 @@
 """
-/target, /addfood, /myfoods — setup handlers
+/start, /setlocation, /target, /addfood, /myfoods — setup handlers
 """
 
 import logging
 import re
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ContextTypes
+from timezonefinder import TimezoneFinder
 
 import database
+import jobs
 
 logger = logging.getLogger("protein_tracker.users")
 
@@ -28,10 +30,16 @@ def _round_protein(val: float) -> float:
 def _round_grams(val: float | int) -> int:
     """Round grams to max 2 decimal places and return as int for storage."""
     return int(round(float(val), MAX_DECIMALS))
+
+
 # user_data keys for pending standard flow
 KEY_STANDARD_MANUAL = "standard_manual"  # search_term for manual add (portion + protein)
 KEY_STANDARD_PENDING_GRAMS = "standard_pending_grams"  # {"user_food_name": str, "protein_per_100g": float}
 KEY_STANDARD_MANUAL_PROTEIN = "standard_manual_protein"  # {"user_food_name": str, "grams": int} - waiting for protein per 100g
+KEY_LOCATION_PENDING = "location_pending"
+SKIP_LOCATION_TEXT = "Skip"
+
+_timezone_finder = TimezoneFinder()
 
 
 def _parse_standard_args(args: str) -> tuple[str | None, int | None]:
@@ -187,14 +195,40 @@ async def target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await database.set_target(user_id, target)
+    await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
     await update.message.reply_text(f"Daily protein target set to {target}g")
     logger.info("target_handler set target=%sg for user %s", target, user_id)
 
 
+LOCATION_PROMPT = (
+    "Share your location so evening reminders can be sent at 19:00 in your local time.\n"
+    "This works best from the Telegram app on your phone. Coordinates are not stored — only your timezone.\n"
+    "Tap Skip to keep your current timezone (UTC if you have not set one)."
+)
+
+
+def _location_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Share location", request_location=True)],
+            [KeyboardButton(SKIP_LOCATION_TEXT)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+async def _prompt_share_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[KEY_LOCATION_PENDING] = True
+    await update.message.reply_text(LOCATION_PROMPT, reply_markup=_location_keyboard())
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start: send welcome message and prompt to set protein target first."""
-    user_id = update.effective_user.id
+    """Handle /start: register user, welcome, and prompt to share location."""
+    user = update.effective_user
+    user_id = user.id
     logger.info("start_handler received /start from user_id=%s", user_id)
+    await database.upsert_user(user_id, user.username, user.first_name)
 
     welcome = """Welcome to Protein Tracker! 🥩
 
@@ -213,10 +247,65 @@ Then use these commands:
 /summary — see summary of all logs for a specific day
 /week - see protein summary for a specific week
 /removelog — remove one or more log entries from today
-/editprotein - edit the protein content of a saved food"""
+/editprotein - edit the protein content of a saved food
+/setlocation — update your timezone (share location again)"""
 
     await update.message.reply_text(welcome)
+    await _prompt_share_location(update, context)
     logger.info("start_handler replied to user %s", user_id)
+
+
+async def setlocation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /setlocation: prompt to share location and update timezone."""
+    user = update.effective_user
+    await database.upsert_user(user.id, user.username, user.first_name)
+    logger.info("setlocation_handler from user_id=%s", user.id)
+    await _prompt_share_location(update, context)
+
+
+async def location_pending_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle location share or Skip while location is pending. Returns True if consumed."""
+    if not context.user_data.get(KEY_LOCATION_PENDING) or not update.message:
+        return False
+    user = update.effective_user
+    user_id = user.id
+
+    text = (update.message.text or "").strip()
+    if text.lower() == SKIP_LOCATION_TEXT.lower():
+        del context.user_data[KEY_LOCATION_PENDING]
+        tz_name = await database.get_timezone(user_id)
+        await update.message.reply_text(
+            f"Keeping timezone {tz_name}. Reminders will be sent at 19:00 {tz_name} "
+            f"if you have a protein target.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
+        logger.info("location skipped; timezone %s for user_id=%s", tz_name, user_id)
+        return True
+
+    location = update.message.location
+    if location is None:
+        return False
+
+    tz_name = _timezone_finder.timezone_at(lat=location.latitude, lng=location.longitude)
+    if not tz_name:
+        await update.message.reply_text(
+            "Could not determine timezone from that location (for example, over the ocean). "
+            "Please share again from land, or tap Skip to keep your current timezone."
+        )
+        logger.info("location timezone lookup failed for user_id=%s", user_id)
+        return True
+
+    del context.user_data[KEY_LOCATION_PENDING]
+    await database.set_timezone(user_id, tz_name)
+    await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
+    await update.message.reply_text(
+        f"Timezone set to {tz_name}. Reminders will be sent at 19:00 {tz_name} "
+        f"if you have a protein target.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    logger.info("timezone set to %s for user_id=%s", tz_name, user_id)
+    return True
 
 
 def _truncate_button_label(text: str, max_len: int = 40) -> str:

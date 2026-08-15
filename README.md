@@ -41,6 +41,20 @@ On startup, the bot creates a connection pool, ensures tables exist, and seeds t
 
 ## Database structure
 
+### `users`
+
+One row per Telegram user. Created on `/start` (and before other writes so foreign keys succeed).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `user_id` | `BIGINT` | Telegram user id (primary key) |
+| `username` | `TEXT` | Telegram @handle (nullable) |
+| `first_name` | `TEXT` | Display name (nullable) |
+| `created_at` | `TIMESTAMPTZ` | Row creation time |
+| `timezone` | `TEXT` | IANA timezone (default `UTC`), from a one-time location share |
+
+`standards`, `logs`, and `targets` reference `users(user_id)` with `ON DELETE CASCADE`.
+
 ### `targets`
 
 One daily protein goal per user.
@@ -95,7 +109,8 @@ Seeded from `usda_protein_foundation.csv` when the table is empty.
 
 | Command | Description |
 | --- | --- |
-| `/start` | Welcome message and command overview |
+| `/start` | Welcome message, command overview, and location prompt for timezone |
+| `/setlocation` | Share location again to update timezone |
 | `/target` | Set daily protein target (grams) |
 | `/addfood` | Save a food with portion size and protein (USDA match or manual) |
 | `/myfoods` | List saved foods |
@@ -112,19 +127,21 @@ Seeded from `usda_protein_foundation.csv` when the table is empty.
 
 ## Reminders
 
-An hourly job checks whether it is 19:00 UTC. At that hour, users who have a target and have not yet met today’s total receive at most one reminder per day (tracked via `targets.last_reminder_date`).
+On `/start`, the bot asks the user to share their location (best from the phone app). Coordinates are not stored; they are converted to an IANA timezone (for example `Europe/Berlin`) and saved on `users.timezone`. Skip keeps the default `UTC`. `/setlocation` updates it later.
+
+Each user who has a protein target gets one daily job at **19:00 in their timezone**. If that day’s total (user’s local date) is already at or above the target, no message is sent. `targets.last_reminder_date` prevents a second send on the same local day.
 
 ## Project layout
 
 ```
 bot.py                      # Entry point, handler registration, polling
-logging_config.py           # Console + rotating users/reminders log files
+logging_config.py           # Console + rotating users.log
 database.py                 # Pool, schema, CRUD
-jobs.py                     # Reminder job
+jobs.py                     # Per-user 19:00 local reminder jobs
 nutrition.py                # Placeholder for future food-lookup helpers
 usda_protein_foundation.csv # USDA seed data
 handlers/
-  setup.py                  # /start, /target, /addfood, /myfoods
+  setup.py                  # /start, /setlocation, /target, /addfood, /myfoods
   bot_logger.py             # /log, /quicklog
   foods.py                  # /find, /deletefood, /editprotein
   summary.py                # /today, /removelog
@@ -154,16 +171,14 @@ Tables are created automatically on first run.
 
 ## Logs
 
-Two rotating log files are written in the project root (kept ~7 days; not committed to git):
+A rotating log file is written in the project root (kept ~7 days; not committed to git):
 
 | File | Contents |
 | --- | --- |
-| `users.log` | User-driven actions (includes `user_id`) |
-| `reminders.log` | Automatic reminder job (`send_reminders_job`) |
+| `users.log` | User-driven actions and reminder send/failure lines (includes `user_id`) |
 
-Console output continues as usual. Examples:
+Console output continues as usual. Example:
 
 ```bash
 grep 'user_id=123' users.log
-grep send_reminders_job reminders.log
 ```

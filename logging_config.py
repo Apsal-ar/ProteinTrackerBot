@@ -1,5 +1,5 @@
 """
-Configure console and rotating file loggers for user actions and reminders.
+Configure console and rotating file logger for user actions.
 """
 
 import logging
@@ -8,7 +8,6 @@ from pathlib import Path
 
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 USERS_LOGGER_NAME = "protein_tracker.users"
-REMINDERS_LOGGER_NAME = "protein_tracker.reminders"
 
 
 def _make_timed_handler(filename: str) -> TimedRotatingFileHandler:
@@ -27,8 +26,8 @@ def _make_timed_handler(filename: str) -> TimedRotatingFileHandler:
 
 def setup_logging() -> None:
     """
-    Root → console. Named loggers → users.log / reminders.log (7-day rotation).
-    Named loggers propagate so their lines also appear on the console.
+    Root → console. Named logger → users.log (7-day rotation).
+    Named logger propagates so its lines also appear on the console.
     """
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -44,9 +43,3 @@ def setup_logging() -> None:
     users_logger.handlers.clear()
     users_logger.addHandler(_make_timed_handler("users.log"))
     users_logger.propagate = True
-
-    reminders_logger = logging.getLogger(REMINDERS_LOGGER_NAME)
-    reminders_logger.setLevel(logging.INFO)
-    reminders_logger.handlers.clear()
-    reminders_logger.addHandler(_make_timed_handler("reminders.log"))
-    reminders_logger.propagate = True

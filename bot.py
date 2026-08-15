@@ -24,6 +24,8 @@ from handlers.foods import (
 from handlers.diff_days import summary_handler, week_handler, yesterday_handler
 from handlers.summary import removelog_callback_handler, removelog_handler, today_handler
 from handlers.setup import (
+    location_pending_message_handler,
+    setlocation_handler,
     start_handler,
     standard_callback_handler,
     standard_handler,
@@ -42,8 +44,8 @@ async def post_init(application):
     """Initialize database connection pool, create tables, and schedule jobs."""
     await database.init_db()
     if application.job_queue is not None:
-        application.job_queue.run_repeating(jobs.send_reminders_job, interval=3600, first=60)
-        logger.info("Scheduled hourly reminder job (19:00 UTC, once per day if target not met)")
+        await jobs.schedule_all_user_reminders(application.job_queue)
+        logger.info("Scheduled daily 19:00 local reminders for users with a target")
     else:
         logger.warning(
             "Job queue is not available. Install the optional dependency: "
@@ -66,7 +68,9 @@ async def error_handler(update, context):
 
 
 async def catch_all_handler(update, context):
-    """Handle pending standard flow or log every incoming update."""
+    """Handle pending location/standard flows or log every incoming update."""
+    if update.message and await location_pending_message_handler(update, context):
+        return
     if update.message and await standard_pending_message_handler(update, context):
         return
     if update.message and await deletefood_pending_message_handler(update, context):
@@ -91,6 +95,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("setlocation", setlocation_handler))
     application.add_handler(CommandHandler("target", target_handler))
     application.add_handler(CommandHandler("addfood", standard_handler))
     application.add_handler(CommandHandler("myfoods", standards_handler))
@@ -111,7 +116,7 @@ def main():
     application.add_handler(CallbackQueryHandler(removelog_callback_handler, pattern="^removelog\|"))
     application.add_handler(MessageHandler(filters.ALL, catch_all_handler))
     application.add_error_handler(error_handler)
-    logger.info("Handlers registered: start, target, addfood, myfoods, log, quicklog, logyesterday, today, summary, week, removelog, deletefood, editprotein, find, catch_all, error_handler")
+    logger.info("Handlers registered: start, setlocation, target, addfood, myfoods, log, quicklog, logyesterday, today, summary, week, removelog, deletefood, editprotein, find, catch_all, error_handler")
 
     application.run_polling(allowed_updates=["message", "callback_query"])
 

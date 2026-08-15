@@ -68,6 +68,19 @@ async def init_db() -> None:
 
     async with pool.acquire() as conn:
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id     BIGINT PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                timezone    TEXT DEFAULT 'UTC'
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS standards (
                 id              SERIAL PRIMARY KEY,
                 user_id         BIGINT NOT NULL,
@@ -134,6 +147,38 @@ async def init_db() -> None:
             ALTER TABLE targets
             ADD COLUMN IF NOT EXISTS last_reminder_date DATE
         """)
+        await conn.execute("""
+            INSERT INTO users (user_id)
+            SELECT user_id FROM targets
+            UNION
+            SELECT user_id FROM logs
+            UNION
+            SELECT user_id FROM standards
+            ON CONFLICT (user_id) DO NOTHING
+        """)
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'fk_standards_user'
+                ) THEN
+                    ALTER TABLE standards ADD CONSTRAINT fk_standards_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'fk_logs_user'
+                ) THEN
+                    ALTER TABLE logs ADD CONSTRAINT fk_logs_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE;
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'fk_targets_user'
+                ) THEN
+                    ALTER TABLE targets ADD CONSTRAINT fk_targets_user
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE;
+                END IF;
+            END $$;
+        """)
         await conn.execute("DROP TABLE IF EXISTS user_notifications")
 
 
@@ -145,6 +190,74 @@ async def close_db() -> None:
         pool = None
 
 
+# --- Users ---
+
+
+async def upsert_user(
+    user_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    """Insert a users row if missing; update username/first_name when provided. Timezone is unchanged on conflict."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username, first_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = COALESCE(EXCLUDED.username, users.username),
+                first_name = COALESCE(EXCLUDED.first_name, users.first_name)
+            """,
+            user_id,
+            username,
+            first_name,
+        )
+
+
+async def set_timezone(user_id: int, tz: str) -> None:
+    """Set the user's IANA timezone. Ensures a users row exists."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    await upsert_user(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET timezone = $1 WHERE user_id = $2",
+            tz,
+            user_id,
+        )
+
+
+async def get_timezone(user_id: int) -> str:
+    """Return the user's IANA timezone, or UTC if unset/missing."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT timezone FROM users WHERE user_id = $1",
+            user_id,
+        )
+        if row and row["timezone"]:
+            return row["timezone"]
+        return "UTC"
+
+
+async def get_users_with_targets() -> list[tuple[int, str]]:
+    """Return (user_id, timezone) for every user who has a protein target."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT t.user_id, COALESCE(u.timezone, 'UTC') AS timezone
+            FROM targets t
+            LEFT JOIN users u ON u.user_id = t.user_id
+            """
+        )
+        return [(r["user_id"], r["timezone"]) for r in rows]
+
+
 # --- Targets ---
 
 
@@ -154,6 +267,7 @@ async def set_target(user_id: int, target_g: int) -> None:
     """
     if pool is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
+    await upsert_user(user_id)
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -179,15 +293,6 @@ async def get_target(user_id: int) -> int | None:
             user_id,
         )
         return row["target"] if row else None
-
-
-async def get_user_ids_with_targets() -> list[int]:
-    """Return list of user_ids that have a target set (for reminder job)."""
-    if pool is None:
-        raise RuntimeError("Database not initialized. Call init_db() first.")
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM targets")
-        return [r["user_id"] for r in rows]
 
 
 async def get_last_reminder_date(user_id: int) -> date | None:
@@ -274,6 +379,7 @@ async def set_standard(
     """
     if pool is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
+    await upsert_user(user_id)
     name = food_name.strip().capitalize()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -456,6 +562,7 @@ async def add_log_for_date(user_id: int, food_name: str, grams: int, protein_g: 
     """
     if pool is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
+    await upsert_user(user_id)
     name = food_name.strip().capitalize()
     async with pool.acquire() as conn:
         await conn.execute(

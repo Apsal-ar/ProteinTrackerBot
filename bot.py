@@ -25,7 +25,8 @@ from handlers.diff_days import summary_handler, week_handler, yesterday_handler
 from handlers.summary import removelog_callback_handler, removelog_handler, today_handler
 from handlers.setup import (
     location_pending_message_handler,
-    setlocation_handler,
+    reminders_callback_handler,
+    reminders_handler,
     start_handler,
     standard_callback_handler,
     standard_handler,
@@ -45,7 +46,7 @@ async def post_init(application):
     await database.init_db()
     if application.job_queue is not None:
         await jobs.schedule_all_user_reminders(application.job_queue)
-        logger.info("Scheduled daily 19:00 local reminders for users with a target")
+        logger.info("Scheduled daily 19:00 local reminders for opted-in users")
     else:
         logger.warning(
             "Job queue is not available. Install the optional dependency: "
@@ -95,7 +96,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler("setlocation", setlocation_handler))
+    application.add_handler(CommandHandler("reminders", reminders_handler))
     application.add_handler(CommandHandler("target", target_handler))
     application.add_handler(CommandHandler("addfood", standard_handler))
     application.add_handler(CommandHandler("myfoods", standards_handler))
@@ -114,9 +115,10 @@ def main():
     application.add_handler(CallbackQueryHandler(deletefood_callback_handler, pattern="^delfood\|"))
     application.add_handler(CallbackQueryHandler(editprotein_callback_handler, pattern="^editprot\|"))
     application.add_handler(CallbackQueryHandler(removelog_callback_handler, pattern="^removelog\|"))
+    application.add_handler(CallbackQueryHandler(reminders_callback_handler, pattern="^reminders\|"))
     application.add_handler(MessageHandler(filters.ALL, catch_all_handler))
     application.add_error_handler(error_handler)
-    logger.info("Handlers registered: start, setlocation, target, addfood, myfoods, log, quicklog, logyesterday, today, summary, week, removelog, deletefood, editprotein, find, catch_all, error_handler")
+    logger.info("Handlers registered: start, reminders, target, addfood, myfoods, log, quicklog, logyesterday, today, summary, week, removelog, deletefood, editprotein, find, catch_all, error_handler")
 
     application.run_polling(allowed_updates=["message", "callback_query"])
 

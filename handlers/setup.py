@@ -1,5 +1,5 @@
 """
-/start, /setlocation, /target, /addfood, /myfoods — setup handlers
+/start, /reminders, /target, /addfood, /myfoods — setup handlers
 """
 
 import logging
@@ -20,6 +20,7 @@ PAGE_SIZE = 4
 STANDARDS_CB_PREFIX = "myfoods|"
 STANDARDS_PAGE_SIZE = 10
 MAX_DECIMALS = 2
+REMINDERS_CB_PREFIX = "reminders|"
 
 
 def _round_protein(val: float) -> float:
@@ -37,7 +38,9 @@ KEY_STANDARD_MANUAL = "standard_manual"  # search_term for manual add (portion +
 KEY_STANDARD_PENDING_GRAMS = "standard_pending_grams"  # {"user_food_name": str, "protein_per_100g": float}
 KEY_STANDARD_MANUAL_PROTEIN = "standard_manual_protein"  # {"user_food_name": str, "grams": int} - waiting for protein per 100g
 KEY_LOCATION_PENDING = "location_pending"
+KEY_REMINDERS_ENABLE_PENDING = "reminders_enable_pending"
 SKIP_LOCATION_TEXT = "Skip"
+KEEP_TIMEZONE_TEXT = "Keep current timezone"
 
 _timezone_finder = TimezoneFinder()
 
@@ -195,36 +198,99 @@ async def target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await database.set_target(user_id, target)
-    await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
+    await jobs.schedule_user_reminder_if_enabled(context.job_queue, user_id)
     await update.message.reply_text(f"Daily protein target set to {target}g")
     logger.info("target_handler set target=%sg for user %s", target, user_id)
 
 
-LOCATION_PROMPT = (
-    "Share your location so evening reminders can be sent at 19:00 in your local time.\n"
-    "This works best from the Telegram app on your phone. Coordinates are not stored — only your timezone.\n"
-    "Tap Skip to keep your current timezone (UTC if you have not set one)."
-)
+def _location_keyboard(*, allow_skip: bool) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton("Share location", request_location=True)]]
+    if allow_skip:
+        rows.append([KeyboardButton(KEEP_TIMEZONE_TEXT)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
-def _location_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Share location", request_location=True)],
-            [KeyboardButton(SKIP_LOCATION_TEXT)],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
+def _existing_timezone_prompt(tz_name: str) -> str:
+    return (
+        f"Your current timezone is {tz_name}.\n"
+        "Do you want to keep it, or share your location to change it?\n"
+        "Coordinates are not stored — only your timezone. "
+        "Sharing location works best from the Telegram app on your phone."
     )
 
 
-async def _prompt_share_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _new_timezone_prompt() -> str:
+    return (
+        "Share your location so evening reminders can be sent at 19:00 in your local time.\n"
+        "This works best from the Telegram app on your phone. Coordinates are not stored — only your timezone."
+    )
+
+
+async def _prompt_share_location(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: str,
+    allow_skip: bool,
+) -> None:
     context.user_data[KEY_LOCATION_PENDING] = True
-    await update.message.reply_text(LOCATION_PROMPT, reply_markup=_location_keyboard())
+    await update.message.reply_text(message, reply_markup=_location_keyboard(allow_skip=allow_skip))
+
+
+async def _prompt_share_location_from_query(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    message: str,
+    allow_skip: bool,
+) -> None:
+    context.user_data[KEY_LOCATION_PENDING] = True
+    await query.message.reply_text(message, reply_markup=_location_keyboard(allow_skip=allow_skip))
+
+
+async def _prompt_timezone_for_enable(
+    update_or_query_message,
+    context: ContextTypes.DEFAULT_TYPE,
+    tz_name: str | None,
+    *,
+    from_query: bool = False,
+) -> None:
+    """Ask for location; if timezone exists, offer keep vs change."""
+    if tz_name:
+        message = _existing_timezone_prompt(tz_name)
+        allow_skip = True
+    else:
+        message = _new_timezone_prompt()
+        allow_skip = False
+    if from_query:
+        await _prompt_share_location_from_query(
+            update_or_query_message, context, message=message, allow_skip=allow_skip
+        )
+    else:
+        await _prompt_share_location(
+            update_or_query_message, context, message=message, allow_skip=allow_skip
+        )
+
+
+async def _finish_enable_reminders(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    tz_name: str,
+) -> None:
+    await database.set_reminders_enabled(user_id, True)
+    await jobs.schedule_user_reminder_if_enabled(context.job_queue, user_id)
+    context.user_data.pop(KEY_REMINDERS_ENABLE_PENDING, None)
+    await update.message.reply_text(
+        f"Daily reminders are on. You'll get a message at 19:00 {tz_name} "
+        f"if you haven't met your protein target.\n"
+        f"You can turn them off anytime with /reminders off.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start: register user, welcome, and prompt to share location."""
+    """Handle /start: register user and send welcome message."""
     user = update.effective_user
     user_id = user.id
     logger.info("start_handler received /start from user_id=%s", user_id)
@@ -248,19 +314,99 @@ Then use these commands:
 /week - see protein summary for a specific week
 /removelog — remove one or more log entries from today
 /editprotein - edit the protein content of a saved food
-/setlocation — update your timezone (share location again)"""
+/reminders — setup daily target reminders (optional)
+/reminders off — turn reminders off"""
 
     await update.message.reply_text(welcome)
-    await _prompt_share_location(update, context)
     logger.info("start_handler replied to user %s", user_id)
 
 
-async def setlocation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /setlocation: prompt to share location and update timezone."""
+async def reminders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /reminders: opt in/out of daily target reminders and set timezone via location.
+    Usage: /reminders, /reminders on, /reminders off
+    """
     user = update.effective_user
-    await database.upsert_user(user.id, user.username, user.first_name)
-    logger.info("setlocation_handler from user_id=%s", user.id)
-    await _prompt_share_location(update, context)
+    user_id = user.id
+    raw_text = update.message.text or ""
+    args = raw_text[len("/reminders") :].strip().lower()
+    await database.upsert_user(user_id, user.username, user.first_name)
+    logger.info("reminders_handler from user_id=%s, args=%r", user_id, args)
+
+    if args == "off":
+        await database.set_reminders_enabled(user_id, False)
+        jobs.unschedule_user_reminder(context.job_queue, user_id)
+        context.user_data.pop(KEY_LOCATION_PENDING, None)
+        context.user_data.pop(KEY_REMINDERS_ENABLE_PENDING, None)
+        await update.message.reply_text(
+            "Daily reminders are off. You won't get evening messages about your protein target.\n"
+            "Send /reminders or /reminders on anytime to turn them back on.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        logger.info("reminders disabled for user_id=%s", user_id)
+        return
+
+    if args == "on":
+        context.user_data[KEY_REMINDERS_ENABLE_PENDING] = True
+        tz_name = await database.get_timezone(user_id)
+        await _prompt_timezone_for_enable(update, context, tz_name, from_query=False)
+        logger.info("reminders on: prompting location for user_id=%s", user_id)
+        return
+
+    # /reminders with no args: show status, or confirm opt-in if currently off
+    enabled = await database.get_reminders_enabled(user_id)
+    tz_name = await database.get_timezone(user_id)
+
+    if enabled:
+        tz_line = f"Current timezone: {tz_name}." if tz_name else "No timezone set yet."
+        await update.message.reply_text(
+            "Daily protein reminders are currently on.\n"
+            f"{tz_line}\n"
+        )
+        return
+
+    tz_line = f"Current timezone: {tz_name}.\n" if tz_name else "No timezone set yet.\n"
+    text = (
+        "Daily protein reminders are currently off.\n"
+        f"{tz_line}\n"
+        "If you enable them, you'll get a message at 19:00 in your local time "
+        "when you haven't met your protein target that day.\n\n"
+        "You can always turn them off later with /reminders off.\n\n"
+        "Enable daily target reminders?"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("Enable", callback_data=f"{REMINDERS_CB_PREFIX}enable"),
+            InlineKeyboardButton("Cancel", callback_data=f"{REMINDERS_CB_PREFIX}cancel"),
+        ]
+    ]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def reminders_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Enable/Cancel for /reminders confirmation."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    user_id = user.id
+    data = query.data or ""
+    if not data.startswith(REMINDERS_CB_PREFIX):
+        return
+    choice = data[len(REMINDERS_CB_PREFIX) :].strip().lower()
+
+    if choice == "cancel":
+        await query.edit_message_text("Cancelled. Reminders were not changed.")
+        return
+
+    if choice != "enable":
+        return
+
+    await database.upsert_user(user_id, user.username, user.first_name)
+    context.user_data[KEY_REMINDERS_ENABLE_PENDING] = True
+    tz_name = await database.get_timezone(user_id)
+    await query.edit_message_text("Setting up daily target reminders…")
+    await _prompt_timezone_for_enable(query, context, tz_name, from_query=True)
+    logger.info("reminders enable confirmed; prompting location for user_id=%s", user_id)
 
 
 async def location_pending_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -269,17 +415,32 @@ async def location_pending_message_handler(update: Update, context: ContextTypes
         return False
     user = update.effective_user
     user_id = user.id
+    enable_pending = bool(context.user_data.get(KEY_REMINDERS_ENABLE_PENDING))
 
     text = (update.message.text or "").strip()
-    if text.lower() == SKIP_LOCATION_TEXT.lower():
+    keep_choice = text.lower() in (
+        SKIP_LOCATION_TEXT.lower(),
+        KEEP_TIMEZONE_TEXT.lower(),
+    )
+    if keep_choice:
         del context.user_data[KEY_LOCATION_PENDING]
         tz_name = await database.get_timezone(user_id)
-        await update.message.reply_text(
-            f"Keeping timezone {tz_name}. Reminders will be sent at 19:00 {tz_name} "
-            f"if you have a protein target.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
+        if not tz_name:
+            context.user_data.pop(KEY_REMINDERS_ENABLE_PENDING, None)
+            await update.message.reply_text(
+                "No timezone is set yet, so reminders can't be enabled. "
+                "Send /reminders or /reminders on and share your location.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            logger.info("location skipped with no timezone for user_id=%s", user_id)
+            return True
+        if enable_pending:
+            await _finish_enable_reminders(update, context, user_id, tz_name)
+        else:
+            await update.message.reply_text(
+                f"Keeping timezone {tz_name}.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
         logger.info("location skipped; timezone %s for user_id=%s", tz_name, user_id)
         return True
 
@@ -289,21 +450,25 @@ async def location_pending_message_handler(update: Update, context: ContextTypes
 
     tz_name = _timezone_finder.timezone_at(lat=location.latitude, lng=location.longitude)
     if not tz_name:
+        has_tz = await database.get_timezone(user_id)
         await update.message.reply_text(
             "Could not determine timezone from that location (for example, over the ocean). "
-            "Please share again from land, or tap Skip to keep your current timezone."
+            "Please share again from land"
+            + (", or tap Keep current timezone." if has_tz else ".")
         )
         logger.info("location timezone lookup failed for user_id=%s", user_id)
         return True
 
     del context.user_data[KEY_LOCATION_PENDING]
     await database.set_timezone(user_id, tz_name)
-    await jobs.schedule_user_reminder_if_target(context.job_queue, user_id)
-    await update.message.reply_text(
-        f"Timezone set to {tz_name}. Reminders will be sent at 19:00 {tz_name} "
-        f"if you have a protein target.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if enable_pending:
+        await _finish_enable_reminders(update, context, user_id, tz_name)
+    else:
+        await update.message.reply_text(
+            f"Timezone set to {tz_name}.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await jobs.schedule_user_reminder_if_enabled(context.job_queue, user_id)
     logger.info("timezone set to %s for user_id=%s", tz_name, user_id)
     return True
 

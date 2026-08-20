@@ -73,12 +73,39 @@ async def init_db() -> None:
                 username    TEXT,
                 first_name  TEXT,
                 created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                timezone    TEXT DEFAULT 'UTC'
+                timezone    TEXT,
+                reminders_enabled BOOLEAN NOT NULL DEFAULT false
             )
         """)
         await conn.execute("""
             ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'
+            ADD COLUMN IF NOT EXISTS timezone TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE users
+            ALTER COLUMN timezone DROP DEFAULT
+        """)
+        await conn.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS reminders_enabled BOOLEAN NOT NULL DEFAULT false
+        """)
+        # One-time: users who already had a timezone were on the old auto-reminder flow
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY
+            )
+        """)
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM schema_migrations WHERE name = 'backfill_reminders_enabled_from_timezone'
+                ) THEN
+                    UPDATE users SET reminders_enabled = true WHERE timezone IS NOT NULL;
+                    INSERT INTO schema_migrations (name)
+                    VALUES ('backfill_reminders_enabled_from_timezone');
+                END IF;
+            END $$;
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS standards (
@@ -229,8 +256,8 @@ async def set_timezone(user_id: int, tz: str) -> None:
         )
 
 
-async def get_timezone(user_id: int) -> str:
-    """Return the user's IANA timezone, or UTC if unset/missing."""
+async def get_timezone(user_id: int) -> str | None:
+    """Return the user's IANA timezone, or None if not set."""
     if pool is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
     async with pool.acquire() as conn:
@@ -240,19 +267,46 @@ async def get_timezone(user_id: int) -> str:
         )
         if row and row["timezone"]:
             return row["timezone"]
-        return "UTC"
+        return None
 
 
-async def get_users_with_targets() -> list[tuple[int, str]]:
-    """Return (user_id, timezone) for every user who has a protein target."""
+async def set_reminders_enabled(user_id: int, enabled: bool) -> None:
+    """Opt user in or out of daily target reminders."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    await upsert_user(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET reminders_enabled = $1 WHERE user_id = $2",
+            enabled,
+            user_id,
+        )
+
+
+async def get_reminders_enabled(user_id: int) -> bool:
+    """Return True if the user has opted in to daily reminders."""
+    if pool is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT reminders_enabled FROM users WHERE user_id = $1",
+            user_id,
+        )
+        return bool(row["reminders_enabled"]) if row else False
+
+
+async def get_users_with_reminders_enabled() -> list[tuple[int, str]]:
+    """Return (user_id, timezone) for users opted into reminders with a timezone and a target."""
     if pool is None:
         raise RuntimeError("Database not initialized. Call init_db() first.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT t.user_id, COALESCE(u.timezone, 'UTC') AS timezone
-            FROM targets t
-            LEFT JOIN users u ON u.user_id = t.user_id
+            SELECT u.user_id, u.timezone
+            FROM users u
+            INNER JOIN targets t ON t.user_id = u.user_id
+            WHERE u.reminders_enabled = true
+              AND u.timezone IS NOT NULL
             """
         )
         return [(r["user_id"], r["timezone"]) for r in rows]

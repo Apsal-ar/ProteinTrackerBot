@@ -1,5 +1,5 @@
 """
-Per-user daily reminder jobs at 19:00 local time.
+Per-user daily reminder jobs at 19:00 local time (opt-in only).
 """
 
 import logging
@@ -20,20 +20,29 @@ def reminder_job_name(user_id: int) -> str:
     return f"{REMINDER_JOB_PREFIX}{user_id}"
 
 
-def schedule_user_reminder(job_queue: JobQueue | None, user_id: int, tz_name: str | None) -> None:
-    """Replace any existing daily reminder job for this user with one at 19:00 in tz_name."""
+def unschedule_user_reminder(job_queue: JobQueue | None, user_id: int) -> None:
+    """Remove any daily reminder job for this user."""
     if job_queue is None:
         return
     name = reminder_job_name(user_id)
     for job in job_queue.get_jobs_by_name(name):
         job.schedule_removal()
-    zone_key = tz_name or "UTC"
+    logger.info("Unscheduled reminder for user_id=%s", user_id)
+
+
+def schedule_user_reminder(job_queue: JobQueue | None, user_id: int, tz_name: str | None) -> None:
+    """Replace any existing daily reminder job for this user with one at 19:00 in tz_name."""
+    if job_queue is None or not tz_name:
+        return
+    name = reminder_job_name(user_id)
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
     try:
-        tz = ZoneInfo(zone_key)
+        tz = ZoneInfo(tz_name)
     except (ZoneInfoNotFoundError, KeyError, ValueError):
         logger.warning(
             "Invalid timezone %r for user_id=%s; skipping reminder schedule",
-            zone_key,
+            tz_name,
             user_id,
         )
         return
@@ -44,33 +53,37 @@ def schedule_user_reminder(job_queue: JobQueue | None, user_id: int, tz_name: st
         name=name,
         data=user_id,
     )
-    logger.info("Scheduled 19:00 %s reminder for user_id=%s", zone_key, user_id)
+    logger.info("Scheduled 19:00 %s reminder for user_id=%s", tz_name, user_id)
 
 
-async def schedule_user_reminder_if_target(job_queue: JobQueue | None, user_id: int) -> None:
-    """Schedule a daily reminder if this user has a protein target."""
+async def schedule_user_reminder_if_enabled(job_queue: JobQueue | None, user_id: int) -> None:
+    """Schedule a daily reminder if the user opted in, has a timezone, and has a target."""
     if job_queue is None:
         return
-    target = await database.get_target(user_id)
-    if target is None:
+    if not await database.get_reminders_enabled(user_id):
+        unschedule_user_reminder(job_queue, user_id)
         return
+    target = await database.get_target(user_id)
     tz_name = await database.get_timezone(user_id)
+    if target is None or not tz_name:
+        unschedule_user_reminder(job_queue, user_id)
+        return
     schedule_user_reminder(job_queue, user_id, tz_name)
 
 
 async def schedule_all_user_reminders(job_queue: JobQueue | None) -> None:
-    """Schedule daily reminders for every user who has a target (called on startup)."""
+    """Schedule daily reminders for every opted-in user with a target (called on startup)."""
     if job_queue is None:
         return
-    users = await database.get_users_with_targets()
+    users = await database.get_users_with_reminders_enabled()
     for user_id, tz_name in users:
         schedule_user_reminder(job_queue, user_id, tz_name)
 
 
 async def send_user_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Send a reminder to one user at 19:00 local time if they have a target
-    and have not met it for their local today.
+    Send a reminder to one user at 19:00 local time if they have opted in,
+    have a target, and have not met it for their local today.
     """
     job = context.job
     if job is None:
@@ -79,10 +92,14 @@ async def send_user_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     if user_id is None:
         return
     try:
+        if not await database.get_reminders_enabled(user_id):
+            return
         target = await database.get_target(user_id)
         if target is None:
             return
         tz_name = await database.get_timezone(user_id)
+        if not tz_name:
+            return
         try:
             tz = ZoneInfo(tz_name)
         except (ZoneInfoNotFoundError, KeyError, ValueError):
